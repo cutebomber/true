@@ -18,8 +18,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"          # From @BotFather
-SENDER_MNEMONIC = "word1 word2 ... word24"     # 24-word seed phrase of sender wallet
+BOT_TOKEN = "8655509455:AAEpEODcdE4VoxD40P2Y7SfU52xEJ8kbua8"          # From @BotFather
+SENDER_MNEMONIC = "cash matrix behind engage hover shoulder include dove process bachelor body cousin lemon around kitten utility trend sunset arm swift host purity animal dose"     # 24-word seed phrase of sender wallet
 TONCENTER_API_KEY = ""                          # Optional: get free key at toncenter.com
 AMOUNT_TON = 0.001                              # Amount to send
 MEMO = "testing!!!"                            # Fixed memo/comment
@@ -199,4 +199,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+
     main()
