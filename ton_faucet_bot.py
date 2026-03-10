@@ -3,7 +3,7 @@ Telegram TON Faucet Bot — Tonkeeper Compatible
 Sends 0.001 TON to provided addresses with memo "testing!!!"
 
 Requirements:
-    pip install python-telegram-bot tonsdk aiohttp PyNaCl
+    pip install python-telegram-bot tonsdk aiohttp pytoniq-core
 
 HOW TO GET YOUR FREE API KEY (fixes "Ratelimit exceeded"):
     1. Open Telegram → search @tonapibot
@@ -13,16 +13,11 @@ HOW TO GET YOUR FREE API KEY (fixes "Ratelimit exceeded"):
 CONFIGURATION:
     BOT_TOKEN         = Telegram bot token from @BotFather
     SENDER_MNEMONIC   = 24-word seed phrase of the sending wallet
-    TONCENTER_API_KEY = Free key from @tonapibot  ← REQUIRED to avoid rate limits
-    USE_BIP39         = True  for Tonkeeper / MyTonWallet
-                      = False for TonHub / tonsdk native wallet
-    WALLET_VERSION    = "v4r2" for Tonkeeper (default)
+    TONCENTER_API_KEY = Free key from @tonapibot on Telegram
+    WALLET_VERSION    = "v4r2" for Tonkeeper (default), "v3r2" for older wallets
 """
 
 import logging
-import hashlib
-import hmac
-import struct
 import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -35,7 +30,6 @@ AMOUNT_TON        = 0.001
 MEMO              = "testing!!!"
 NETWORK           = "mainnet" # "mainnet" or "testnet"
 WALLET_VERSION    = "v4r2"    # "v3r2" or "v4r2"
-USE_BIP39         = True      # True = Tonkeeper/MyTonWallet | False = TON native
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -46,175 +40,196 @@ TONCENTER_BASE = {
     "testnet": "https://testnet.toncenter.com/api/v2",
 }
 
-# One transaction at a time — prevents seqno conflicts when multiple users request simultaneously
+# One tx at a time — prevents seqno conflicts with concurrent users
 _tx_lock = asyncio.Lock()
 
 
-# ─── RATE-LIMIT-AWARE API CALLER ─────────────────────────────────────────────
+# ─── KEY DERIVATION (supports both Tonkeeper BIP39 and TON native) ─────────────
 
-async def toncenter_get(session, method, params, headers, retries=6):
-    """GET with automatic retry on HTTP 429 rate limit."""
-    base_url = TONCENTER_BASE[NETWORK]
-    for attempt in range(retries):
-        async with session.get(f"{base_url}/{method}", params=params, headers=headers) as resp:
-            if resp.status == 429:
-                wait = 2.0 * (attempt + 1)
-                logger.warning(f"Rate limited [{method}], retry in {wait}s ({attempt+1}/{retries})")
-                await asyncio.sleep(wait)
-                continue
-            return await resp.json()
-    return {"ok": False, "error": "Rate limit: too many retries. Set TONCENTER_API_KEY from @tonapibot"}
-
-
-async def toncenter_post(session, method, body, headers, retries=6):
-    """POST with automatic retry on HTTP 429 rate limit."""
-    base_url = TONCENTER_BASE[NETWORK]
-    for attempt in range(retries):
-        async with session.post(f"{base_url}/{method}", json=body, headers=headers) as resp:
-            if resp.status == 429:
-                wait = 2.0 * (attempt + 1)
-                logger.warning(f"Rate limited [{method}], retry in {wait}s ({attempt+1}/{retries})")
-                await asyncio.sleep(wait)
-                continue
-            return await resp.json()
-    return {"ok": False, "error": "Rate limit: too many retries. Set TONCENTER_API_KEY from @tonapibot"}
-
-
-# ─── KEY DERIVATION ───────────────────────────────────────────────────────────
-
-def bip39_to_seed(mnemonic: str) -> bytes:
-    return hashlib.pbkdf2_hmac("sha512", mnemonic.strip().encode(), b"mnemonic", 2048)
-
-
-def slip10_derive_ed25519(seed: bytes) -> tuple:
-    """Tonkeeper key derivation: SLIP-0010 path m/44'/607'/0'"""
-    def ckd(k, c, index):
-        data = b"\x00" + k + struct.pack(">I", 0x80000000 | index)
-        I = hmac.new(c, data, hashlib.sha512).digest()
-        return I[:32], I[32:]
-
-    I = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
-    kL, kR = I[:32], I[32:]
-    for i in [44, 607, 0]:
-        kL, kR = ckd(kL, kR, i)
-
-    import nacl.signing
-    pub = bytes(nacl.signing.SigningKey(kL).verify_key)
-    return kL, pub
-
-
-def build_wallet_from_pubkey(pub_key: bytes, version: str, workchain: int = 0):
-    from tonsdk.contract.wallet import WalletV3ContractR1, WalletV3ContractR2, WalletV4ContractR2
-    cls = {"v3r1": WalletV3ContractR1, "v3r2": WalletV3ContractR2, "v4r2": WalletV4ContractR2}[version]
-    return cls(public_key=pub_key, wc=workchain)
-
-
-def build_keypair():
+def derive_keypair_from_mnemonic():
+    """
+    Derives private key + public key from mnemonic.
+    Automatically tries Tonkeeper BIP39 derivation first (pytoniq-core),
+    then falls back to tonsdk TON-native derivation.
+    Returns (priv_key_bytes, pub_key_bytes, wallet_address_string)
+    """
     words = SENDER_MNEMONIC.strip().split()
     if len(words) != 24:
-        raise ValueError(f"Mnemonic must be 24 words, got {len(words)}")
+        raise ValueError(f"Expected 24 mnemonic words, got {len(words)}")
 
-    if USE_BIP39:
-        seed = bip39_to_seed(SENDER_MNEMONIC)
-        priv_key, pub_key = slip10_derive_ed25519(seed)
-        wallet = build_wallet_from_pubkey(pub_key, WALLET_VERSION)
-        return priv_key, pub_key, wallet
-    else:
-        from tonsdk.contract.wallet import Wallets, WalletVersionEnum
-        version_map = {
-            "v3r1": WalletVersionEnum.v3r1,
-            "v3r2": WalletVersionEnum.v3r2,
-            "v4r2": WalletVersionEnum.v4r2,
-        }
-        _, pub_key, priv_key, wallet = Wallets.from_mnemonics(
-            words, version_map[WALLET_VERSION], workchain=0
-        )
-        return priv_key, pub_key, wallet
-
-
-def sign_bip39(priv_key: bytes, msg_bytes: bytes) -> bytes:
-    import nacl.signing
-    return bytes(nacl.signing.SigningKey(priv_key).sign(msg_bytes).signature)
-
-
-# ─── TON TRANSFER ─────────────────────────────────────────────────────────────
-
-async def get_account_state(session, address, headers):
-    data = await toncenter_get(session, "getAddressInformation", {"address": address}, headers)
-    if not data.get("ok"):
-        raise RuntimeError(f"getAddressInformation failed: {data}")
-    state   = data["result"].get("state", "uninitialized")
-    balance = int(data["result"].get("balance", 0)) / 1e9
-    return state, balance
-
-
-async def get_seqno(session, address, headers) -> int:
-    data = await toncenter_get(session, "runGetMethod",
-        {"address": address, "method": "seqno", "stack": "[]"}, headers)
+    # ── Try pytoniq-core (handles Tonkeeper BIP39 correctly) ─────────────────
     try:
-        if data.get("ok") and data["result"].get("exit_code") == 0:
-            stack = data["result"].get("stack", [])
-            if stack:
-                return int(stack[0][1], 16)
-    except Exception:
-        pass
-    return 0
+        from pytoniq_core.crypto.keys import mnemonic_to_private_key, mnemonic_is_legacy
+        from pytoniq_core.crypto.signature import sign_message
 
+        is_legacy = mnemonic_is_legacy(words)
+        logger.info(f"Mnemonic type: {'TON native/legacy' if is_legacy else 'BIP39/Tonkeeper'}")
+
+        pub_key, priv_key = mnemonic_to_private_key(words)
+        return priv_key, pub_key, "pytoniq"
+
+    except ImportError:
+        logger.warning("pytoniq-core not installed, falling back to tonsdk native derivation")
+
+    # ── Fallback: tonsdk native ───────────────────────────────────────────────
+    from tonsdk.contract.wallet import Wallets, WalletVersionEnum
+    version_map = {
+        "v3r1": WalletVersionEnum.v3r1,
+        "v3r2": WalletVersionEnum.v3r2,
+        "v4r2": WalletVersionEnum.v4r2,
+    }
+    _, pub_key, priv_key, wallet = Wallets.from_mnemonics(
+        words, version_map[WALLET_VERSION], workchain=0
+    )
+    addr = wallet.address.to_string(True, True, False)
+    return priv_key, pub_key, addr
+
+
+def build_wallet_and_keys():
+    """
+    Returns (priv_key, pub_key, wallet_object, sender_address)
+    Works with both pytoniq-core (Tonkeeper) and tonsdk native.
+    """
+    words = SENDER_MNEMONIC.strip().split()
+    if len(words) != 24:
+        raise ValueError(f"Expected 24 mnemonic words, got {len(words)}")
+
+    # ── pytoniq-core path (correct for Tonkeeper BIP39) ──────────────────────
+    try:
+        from pytoniq_core.crypto.keys import mnemonic_to_private_key, mnemonic_is_legacy
+        import nacl.signing
+        from tonsdk.contract.wallet import WalletV3ContractR2, WalletV4ContractR2
+
+        pub_key, priv_key = mnemonic_to_private_key(words)
+
+        # Build wallet address using tonsdk with the correct public key
+        cls = WalletV4ContractR2 if WALLET_VERSION == "v4r2" else WalletV3ContractR2
+
+        # tonsdk wallet classes take an options dict
+        wallet = cls(options={"public_key": pub_key, "wc": 0})
+        sender_addr = wallet.address.to_string(True, True, False)
+
+        logger.info(f"pytoniq-core derivation OK. Address: {sender_addr}")
+        return priv_key, pub_key, wallet, sender_addr, "pytoniq"
+
+    except ImportError:
+        logger.warning("pytoniq-core not found — using tonsdk native (may not match Tonkeeper)")
+    except Exception as e:
+        logger.warning(f"pytoniq-core path failed: {e} — trying tonsdk native")
+
+    # ── tonsdk native fallback ────────────────────────────────────────────────
+    from tonsdk.contract.wallet import Wallets, WalletVersionEnum
+    version_map = {
+        "v3r1": WalletVersionEnum.v3r1,
+        "v3r2": WalletVersionEnum.v3r2,
+        "v4r2": WalletVersionEnum.v4r2,
+    }
+    _, pub_key, priv_key, wallet = Wallets.from_mnemonics(
+        words, version_map[WALLET_VERSION], workchain=0
+    )
+    sender_addr = wallet.address.to_string(True, True, False)
+    logger.info(f"tonsdk native derivation. Address: {sender_addr}")
+    return priv_key, pub_key, wallet, sender_addr, "tonsdk"
+
+
+def sign_with_priv_key(priv_key: bytes, msg: bytes) -> bytes:
+    """Sign msg bytes with Ed25519 private key."""
+    import nacl.signing
+    return bytes(nacl.signing.SigningKey(priv_key).sign(msg).signature)
+
+
+# ─── RATE-LIMIT-AWARE TON CENTER CALLS ────────────────────────────────────────
+
+async def tc_get(session, method, params, headers, retries=6):
+    base = TONCENTER_BASE[NETWORK]
+    for attempt in range(retries):
+        async with session.get(f"{base}/{method}", params=params, headers=headers) as r:
+            if r.status == 429:
+                wait = 2.0 * (attempt + 1)
+                logger.warning(f"Rate limited on {method}, waiting {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            return await r.json()
+    return {"ok": False, "error": "Rate limit — max retries exceeded. Set TONCENTER_API_KEY from @tonapibot"}
+
+
+async def tc_post(session, method, body, headers, retries=6):
+    base = TONCENTER_BASE[NETWORK]
+    for attempt in range(retries):
+        async with session.post(f"{base}/{method}", json=body, headers=headers) as r:
+            if r.status == 429:
+                wait = 2.0 * (attempt + 1)
+                logger.warning(f"Rate limited on {method}, waiting {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            return await r.json()
+    return {"ok": False, "error": "Rate limit — max retries exceeded. Set TONCENTER_API_KEY from @tonapibot"}
+
+
+# ─── SEND TON ─────────────────────────────────────────────────────────────────
 
 async def send_ton(to_address: str, amount_ton: float, memo: str) -> dict:
     import aiohttp
     from tonsdk.utils import to_nano, bytes_to_b64str
 
     try:
-        priv_key, pub_key, wallet = build_keypair()
-    except ImportError as e:
-        return {"ok": False, "error": f"Missing library: {e}. Run: pip install tonsdk PyNaCl aiohttp"}
+        priv_key, pub_key, wallet, sender_addr, derivation = build_wallet_and_keys()
     except Exception as e:
-        return {"ok": False, "error": f"Key derivation failed: {e}"}
+        return {"ok": False, "error": f"Wallet init failed: {e}"}
 
     headers = {"Content-Type": "application/json"}
     if TONCENTER_API_KEY:
         headers["X-API-Key"] = TONCENTER_API_KEY
     else:
-        logger.warning("No TONCENTER_API_KEY set — limited to 1 req/sec, rate limits likely!")
+        logger.warning("No API key — rate limits likely! Get one free from @tonapibot")
 
-    # Serialize all transactions — prevents seqno reuse if two users send at once
     async with _tx_lock:
         try:
             async with aiohttp.ClientSession() as session:
-                sender_addr = wallet.address.to_string(True, True, False)
-                logger.info(f"Sender: {sender_addr}")
 
-                # 1. Balance check
-                state, balance = await get_account_state(session, sender_addr, headers)
-                logger.info(f"State={state}  Balance={balance:.5f} TON")
+                # 1. Check balance
+                acc = await tc_get(session, "getAddressInformation", {"address": sender_addr}, headers)
+                if not acc.get("ok"):
+                    return {"ok": False, "error": f"Could not fetch balance: {acc}"}
 
-                min_needed = amount_ton + 0.015
-                if balance < min_needed:
+                balance = int(acc["result"].get("balance", 0)) / 1e9
+                state   = acc["result"].get("state", "uninitialized")
+                logger.info(f"Sender={sender_addr} State={state} Balance={balance:.5f} TON")
+
+                if balance < amount_ton + 0.015:
+                    uq_addr = wallet.address.to_string(True, False, False)
                     return {
                         "ok": False,
                         "error": (
-                            f"Insufficient balance: {balance:.5f} TON available, "
-                            f"need {min_needed:.4f} TON (amount + fees).\n"
-                            f"Deposit TON to: `{sender_addr}`"
+                            f"Insufficient balance: {balance:.5f} TON.\n"
+                            f"Need at least {amount_ton + 0.015:.4f} TON.\n\n"
+                            f"Deposit TON to sender wallet:\n`{uq_addr}`"
                         )
                     }
 
-                # 2. Seqno
-                seqno = await get_seqno(session, sender_addr, headers)
+                await asyncio.sleep(0.4)  # avoid rate limit between calls
+
+                # 2. Get seqno
+                sq = await tc_get(session, "runGetMethod",
+                    {"address": sender_addr, "method": "seqno", "stack": "[]"}, headers)
+                seqno = 0
+                try:
+                    if sq.get("ok") and sq["result"].get("exit_code") == 0:
+                        seqno = int(sq["result"]["stack"][0][1], 16)
+                except Exception:
+                    pass
                 logger.info(f"Seqno={seqno}")
 
-                # Small delay between API calls to respect rate limits
-                await asyncio.sleep(0.5 if TONCENTER_API_KEY else 1.2)
+                await asyncio.sleep(0.4)
 
-                # 3. Build + sign message
-                if USE_BIP39:
+                # 3. Build + sign transfer
+                if derivation == "pytoniq":
                     transfer = wallet.create_transfer_message(
                         to_addr=to_address,
                         amount=to_nano(amount_ton, "ton"),
                         seqno=seqno,
                         payload=memo,
-                        sign_func=lambda msg: sign_bip39(priv_key, msg),
+                        sign_func=lambda msg: sign_with_priv_key(priv_key, msg),
                     )
                 else:
                     transfer = wallet.create_transfer_message(
@@ -227,7 +242,7 @@ async def send_ton(to_address: str, amount_ton: float, memo: str) -> dict:
                 boc = bytes_to_b64str(transfer["message"].to_boc(False))
 
                 # 4. Broadcast
-                result = await toncenter_post(session, "sendBoc", {"boc": boc}, headers)
+                result = await tc_post(session, "sendBoc", {"boc": boc}, headers)
                 logger.info(f"sendBoc -> {result}")
                 return result
 
@@ -258,7 +273,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ *How to use:*\n\n"
@@ -271,13 +285,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
 async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = update.message.text.strip()
 
     if not is_valid_ton_address(address):
         await update.message.reply_text(
-            "❌ *Invalid TON address.*\n\nPlease send a valid address like:\n"
+            "❌ *Invalid TON address.*\n\nSend a valid address like:\n"
             "`EQD4FPq-PRDieyQKkizFTRtSDyucUIqrj0v_zXJmqaDp6_0t`",
             parse_mode="Markdown"
         )
@@ -303,8 +316,7 @@ async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         error = result.get("error") or str(result.get("result", "Unknown error"))
         await msg.edit_text(
-            f"❌ *Failed*\n\n`{error}`\n\n"
-            f"_If you see 'Ratelimit', get a free API key from @tonapibot_",
+            f"❌ *Failed*\n\n`{error}`",
             parse_mode="Markdown"
         )
         logger.error(f"FAILED: {error}")
@@ -314,25 +326,23 @@ async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application):
     try:
-        _, _, wallet = build_keypair()
-        addr_eq = wallet.address.to_string(True,  True,  False)
-        addr_uq = wallet.address.to_string(True,  False, False)
-        mode    = "BIP39/Tonkeeper" if USE_BIP39 else "TON Native"
+        priv_key, pub_key, wallet, addr_eq, derivation = build_wallet_and_keys()
+        addr_uq = wallet.address.to_string(True, False, False)
         has_key = "✅ Set" if TONCENTER_API_KEY else "❌ MISSING — get free key from @tonapibot!"
-        print(f"\n{'='*60}")
-        print(f"  Mode          : {mode}")
-        print(f"  Wallet ver    : {WALLET_VERSION}")
-        print(f"  Network       : {NETWORK}")
+        net     = "testnet." if NETWORK == "testnet" else ""
+        print(f"\n{'='*62}")
+        print(f"  Derivation    : {derivation} ({'Tonkeeper BIP39' if derivation == 'pytoniq' else 'TON native'})")
+        print(f"  Wallet ver    : {WALLET_VERSION}  |  Network: {NETWORK}")
         print(f"  API Key       : {has_key}")
         print(f"  Sender EQ...  : {addr_eq}")
         print(f"  Sender UQ...  : {addr_uq}")
         print(f"  Amount/tx     : {AMOUNT_TON} TON  |  Memo: {MEMO}")
-        print(f"{'='*60}")
-        net = "testnet." if NETWORK == "testnet" else ""
-        print(f"\n  Deposit TON to UQ address above to fund the bot")
-        print(f"  Check balance: https://{net}tonscan.org/address/{addr_uq}\n")
+        print(f"{'='*62}")
+        print(f"\n  ⚠️  Deposit TON to the UQ... address above to fund the bot")
+        print(f"  Check: https://{net}tonscan.org/address/{addr_uq}\n")
     except Exception as e:
         print(f"⚠️  Startup error: {e}")
+        import traceback; traceback.print_exc()
 
 
 def main():
@@ -343,14 +353,12 @@ def main():
         print("❌ Set SENDER_MNEMONIC before running!")
         return
     if not TONCENTER_API_KEY:
-        print("⚠️  WARNING: No TONCENTER_API_KEY — you will hit rate limits!")
-        print("   Get a free key from @tonapibot on Telegram\n")
+        print("⚠️  No TONCENTER_API_KEY — rate limits likely! Get free key from @tonapibot\n")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address))
-
     print("🤖 Bot starting...")
     app.run_polling()
 
