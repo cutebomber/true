@@ -209,16 +209,36 @@ async def send_ton(to_address: str, amount_ton: float, memo: str) -> dict:
 
                 await asyncio.sleep(0.4)  # avoid rate limit between calls
 
-                # 2. Get seqno
-                sq = await tc_get(session, "runGetMethod",
-                    {"address": sender_addr, "method": "seqno", "stack": "[]"}, headers)
-                seqno = 0
+                # 2. Get seqno — use getWalletInformation (more reliable than runGetMethod)
+                seqno = None
+                wi = await tc_get(session, "getWalletInformation", {"address": sender_addr}, headers)
+                logger.info(f"getWalletInformation response: {wi}")
                 try:
-                    if sq.get("ok") and sq["result"].get("exit_code") == 0:
-                        seqno = int(sq["result"]["stack"][0][1], 16)
-                except Exception:
-                    pass
-                logger.info(f"Seqno={seqno}")
+                    if wi.get("ok") and wi["result"].get("seqno") is not None:
+                        seqno = int(wi["result"]["seqno"])
+                        logger.info(f"Seqno from getWalletInformation: {seqno}")
+                except Exception as e:
+                    logger.warning(f"getWalletInformation seqno parse failed: {e}")
+
+                # Fallback: runGetMethod
+                if seqno is None:
+                    await asyncio.sleep(0.4)
+                    sq = await tc_get(session, "runGetMethod",
+                        {"address": sender_addr, "method": "seqno", "stack": "[]"}, headers)
+                    logger.info(f"runGetMethod response: {sq}")
+                    try:
+                        if sq.get("ok") and sq["result"].get("exit_code") == 0:
+                            raw = sq["result"]["stack"][0][1]
+                            # stack value can be decimal string or hex string
+                            seqno = int(raw, 16) if raw.startswith("0x") else int(raw)
+                            logger.info(f"Seqno from runGetMethod: {seqno}")
+                    except Exception as e:
+                        logger.warning(f"runGetMethod seqno parse failed: {e}, raw response: {sq}")
+
+                if seqno is None:
+                    return {"ok": False, "error": "Could not fetch wallet seqno. Wallet may not be deployed yet or API is unreachable."}
+
+                logger.info(f"Final seqno={seqno}")
 
                 await asyncio.sleep(0.4)
 
